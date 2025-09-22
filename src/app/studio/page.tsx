@@ -1,4 +1,4 @@
-// src/app/studio/page.tsx  (solo cambia la parte de run() y se agrega requestId)
+// src/app/studio/page.tsx
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
@@ -21,6 +21,7 @@ export default function Studio() {
   const [translated, setTranslated] = useState<TransItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [from, setFrom] = useState<"ja" | "en">("ja");
+  const [useDirectIA, setUseDirectIA] = useState(false);
 
   const hasTranslation = translated.some((t) => t.text);
 
@@ -53,14 +54,79 @@ export default function Studio() {
       }
       setLoading(true);
 
-      // 1) mosaico
-      const { b64: sheetB64, cells } = await buildRoiMosaicOneColumn(
-        img,
-        rois,
-        imgSize.w,
-        STAGE_W,
-        { cellW: 600, padding: 18 }
-      );
+      // 1) Construir mosaico (y opcionalmente crops para IA directa)
+      const {
+        b64: sheetB64,
+        cells,
+        crops,
+      } = await buildRoiMosaicOneColumn(img, rois, imgSize.w, STAGE_W, {
+        cellW: 600,
+        padding: 18,
+        returnCrops: useDirectIA, // ← si activaste IA directa, también devolvé crops
+        cropMaxW: 768, // controla tamaño/costo de la IA
+        cropFormat: "image/jpeg",
+        cropJpegQuality: 0.85,
+      });
+
+      // === PIPELINE: IA DIRECTA POR ROIs (experimental) ===
+      if (useDirectIA) {
+        const requestId = crypto.randomUUID();
+        const roiCount = crops?.length ?? 0;
+        if (roiCount === 0) {
+          toast.error("No se pudieron generar recortes para IA directa");
+          return;
+        }
+        const sourceLang = from === "en" ? "en" : "ja";
+        const targetLang = "es";
+
+        const trRes = await fetch("/api/translate-direct", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            meta: {
+              requestId,
+              source_lang: sourceLang,
+              target_lang: targetLang,
+              roi_count: roiCount,
+              image_w: imgSize.w,
+              image_h: imgSize.h,
+            },
+            from,
+            crops, // [{id, b64}]
+          }),
+        });
+
+        if (trRes.status === 401) {
+          toast.error("Sesión expirada. Entrá de nuevo.");
+          return;
+        }
+        if (trRes.status === 429) {
+          toast.error("Demasiadas solicitudes. Probá en un minuto.");
+          return;
+        }
+        const tr = await trRes.json();
+        if (tr.error) {
+          toast.error(tr.error);
+          return;
+        }
+
+        // Ordenar por id de ROI para que coincida con la UI
+        const out: TransItem[] = rois
+          .map((r) => {
+            const hit = tr.items?.find(
+              (x: TransItem) => String(x.id) === String(r.id)
+            );
+            return { id: r.id, text: postGlossaryEs(hit?.text || "") };
+          })
+          .sort((a, b) => a.id - b.id);
+
+        setTranslated(out);
+        toast.success("¡Listo (IA directa)!");
+        window.dispatchEvent(new Event("credits:updated"));
+        return;
+      }
+
+      // === PIPELINE CLÁSICO: OCR → IA TEXTO ===
 
       // 2) OCR del mosaico
       const ocrRes = await fetch("/api/ocr", {
@@ -68,6 +134,16 @@ export default function Studio() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ imageBase64: sheetB64 }),
       });
+
+      if (ocrRes.status === 401) {
+        toast.error("Sesión expirada. Entrá de nuevo.");
+        return;
+      }
+      if (ocrRes.status === 429) {
+        toast.error("Demasiadas solicitudes. Probá en un minuto.");
+        return;
+      }
+
       const ocr = await ocrRes.json();
       if (ocr.error) throw new Error(ocr.error);
 
@@ -97,14 +173,14 @@ export default function Studio() {
       if (!itemsSrc.length)
         throw new Error("No se reconoció texto en los globos.");
 
-      // 3) Preparar meta para el backend (créditos)
+      // 3) Meta para backend (créditos)
       const requestId = crypto.randomUUID();
       const roiCount = itemsSrc.length;
       const charCount = itemsSrc.reduce((acc, it) => acc + it.text.length, 0);
       const sourceLang = from === "en" ? "en" : "ja";
       const targetLang = "es";
 
-      // 4) Traducción + gasto (lo hace el endpoint de forma transaccional)
+      // 4) Traducción + gasto (endpoint transaccional)
       const trRes = await fetch(`/api/translate-and-spend`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -125,6 +201,10 @@ export default function Studio() {
 
       if (trRes.status === 401) {
         toast.error("Sesión expirada. Entrá de nuevo.");
+        return;
+      }
+      if (trRes.status === 429) {
+        toast.error("Demasiadas solicitudes. Probá en un minuto.");
         return;
       }
       const tr = await trRes.json();
@@ -211,16 +291,46 @@ export default function Studio() {
           </>
         )}
 
-        {/* mover los controles debajo del canvas */}
-        <div className="mt-4 flex justify-between gap-2">
-          <select
-            value={from}
-            onChange={(e) => setFrom(e.target.value as any)}
-            className="border rounded px-2 py-1 text-sm bg-neutral-900 border-neutral-800"
-          >
-            <option value="ja">Japonés → Español</option>
-            <option value="en">Inglés → Español</option>
-          </select>
+        {/* Controles */}
+        <div className="mt-4 flex flex-wrap justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <select
+              value={from}
+              onChange={(e) => setFrom(e.target.value as any)}
+              className="border rounded px-2 py-1 text-sm bg-neutral-900 border-neutral-800"
+            >
+              <option value="ja">Japonés → Español</option>
+              <option value="en">Inglés → Español</option>
+            </select>
+
+            {/* Switch con tooltip bonito */}
+            <div className="relative group flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={useDirectIA}
+                onChange={(e) => setUseDirectIA(e.target.checked)}
+                className="cursor-pointer"
+                id="directIA"
+              />
+              <label
+                htmlFor="directIA"
+                className="text-sm select-none cursor-pointer"
+              >
+                IA directa (sin OCR)
+              </label>
+              <div className="absolute bottom-full mb-2 hidden w-64 rounded-lg bg-neutral-900 text-white text-xs p-3 shadow-lg group-hover:block transition-opacity duration-200">
+                <p className="font-semibold text-amber-400 mb-1">
+                  ⚠️ Experimental
+                </p>
+                <p>
+                  Este modo saltea el OCR: recorta cada globo y lo envía directo
+                  a la IA. Puede mejorar calidad en algunos casos, pero su costo
+                  es <span className="text-red-400 font-semibold">MUCHO</span>{" "}
+                  mayor por globo (10 creditos).
+                </p>
+              </div>
+            </div>
+          </div>
           <button
             onClick={run}
             disabled={!img || !rois.length || loading}
@@ -231,7 +341,7 @@ export default function Studio() {
         </div>
       </div>
 
-      {/* derecha */}
+      {/* Panel derecho */}
       <aside className="space-y-6">
         <div className="p-4 border border-neutral-800 rounded-xl bg-neutral-950">
           <h2 className="font-semibold">Globos seleccionados</h2>
