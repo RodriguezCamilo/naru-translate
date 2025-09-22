@@ -135,6 +135,14 @@ export default function Studio() {
         body: JSON.stringify({ imageBase64: sheetB64 }),
       });
 
+      if (ocrRes.status === 422) {
+        const payload = await ocrRes.json();
+        toast.error(
+          payload?.error || "No se detectó texto. No se descontaron créditos."
+        );
+        return;
+      }
+      
       if (ocrRes.status === 401) {
         toast.error("Sesión expirada. Entrá de nuevo.");
         return;

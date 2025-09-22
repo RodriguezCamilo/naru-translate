@@ -4,9 +4,10 @@ import { visionClient } from "@/lib/google";
 import { createSupabaseServer } from "@/lib/supabase-server";
 import { allow, ratelimitHeaders } from "@/lib/ratelimit";
 import { getClientIp } from "@/lib/get-ip";
+import { isBlocked, noteEmptyOcr, resetStrikes } from "@/lib/abuse";
 
 export const runtime = "nodejs";
-const MAX_BASE64_CHARS = 6_500_000; // ~5MB binarios aprox
+const MAX_BASE64_CHARS = 6_500_000; // ~5MB aprox
 
 export async function POST(req: NextRequest) {
   try {
@@ -14,6 +15,21 @@ export async function POST(req: NextRequest) {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
+    // Bloqueo por vacíos consecutivos
+    const block = isBlocked(user.id);
+    if (block.blocked) {
+      return new NextResponse(
+        JSON.stringify({ error: "Bloqueo temporal por OCR vacío reiterado." }),
+        {
+          status: 429,
+          headers: {
+            "X-Blocked-Until": String(Math.ceil(block.blockedUntil / 1000)),
+          },
+        }
+      );
+    }
+
+    // Rate limit
     const ip = getClientIp(req);
     const hitUser = allow(`ocr:${user.id}`, 30, 60_000);
     const hitIp   = allow(`ip:${ip}`,      60, 60_000);
@@ -31,12 +47,11 @@ export async function POST(req: NextRequest) {
     }
 
     const base64Data = (imageBase64.split(",").pop() || imageBase64).trim();
-
     if (base64Data.length > MAX_BASE64_CHARS) {
-      return NextResponse.json({ error: "Imagen demasiado grande" }, {
-        status: 413,
-        headers: ratelimitHeaders(hitUser.remaining, hitUser.resetAt),
-      });
+      return NextResponse.json(
+        { error: "Imagen demasiado grande" },
+        { status: 413, headers: ratelimitHeaders(hitUser.remaining, hitUser.resetAt) }
+      );
     }
 
     const [result] = await visionClient.documentTextDetection({
@@ -45,9 +60,7 @@ export async function POST(req: NextRequest) {
     });
 
     const ann = result.fullTextAnnotation;
-    const fullText = ann?.text || "";
     const words: { text: string; box: { x: number; y: number }[] }[] = [];
-
     for (const page of ann?.pages ?? []) {
       for (const block of page.blocks ?? []) {
         for (const par of block.paragraphs ?? []) {
@@ -63,9 +76,28 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    return NextResponse.json({ fullText, words }, {
-      headers: ratelimitHeaders(hitUser.remaining, hitUser.resetAt),
-    });
+    // ⚠️ Si el mosaico (ROIs) no tuvo texto → NO COBRAR, sumar strike y 422
+    if (words.length === 0) {
+      const { count, blockedUntil } = noteEmptyOcr(user.id);
+      const headers: Record<string,string> = {
+        "X-Empty-Attempts": String(count),
+        ...ratelimitHeaders(hitUser.remaining, hitUser.resetAt),
+      };
+      if (blockedUntil) headers["X-Blocked-Until"] = String(Math.ceil(blockedUntil / 1000));
+
+      return new NextResponse(
+        JSON.stringify({ error: "No se detectó texto en los globos. No se descontaron créditos." }),
+        { status: 422, headers }
+      );
+    }
+
+    // Si hubo texto → resetea strikes y devuelve normal
+    resetStrikes(user.id);
+    const fullText = ann?.text || "";
+    return NextResponse.json(
+      { fullText, words },
+      { headers: ratelimitHeaders(hitUser.remaining, hitUser.resetAt) }
+    );
   } catch (err: any) {
     console.error(err);
     return NextResponse.json({ error: err.message || "OCR failed" }, { status: 500 });
