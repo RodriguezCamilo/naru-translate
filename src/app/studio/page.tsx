@@ -5,14 +5,30 @@ import { useCallback, useMemo, useState } from "react";
 import Dropzone from "react-dropzone";
 import toast, { Toaster } from "react-hot-toast";
 import AnnotatorSelect, { ROI } from "@/components/AnnotatorSelect";
-import {
-  buildRoiMosaicOneColumn,
-  normalizeJa,
-  postGlossaryEs,
-} from "@/lib/mosaic";
+import { buildRoiMosaicOneColumn, normalizeJa, postGlossaryEs } from "@/lib/mosaic";
 
 type TransItem = { id: number; text: string };
+
+type Phase =
+  | "idle"
+  | "validating"
+  | "mosaic"
+  | "ocr"
+  | "grouping"
+  | "translate"
+  | "render";
+
 const STAGE_W = 640;
+
+const phaseLabel: Record<Phase, string> = {
+  idle: "",
+  validating: "Validando selección…",
+  mosaic: "Armando mosaico…",
+  ocr: "Leyendo texto (OCR)…",
+  grouping: "Ordenando globos…",
+  translate: "Traduciendo…",
+  render: "Renderizando resultados…",
+};
 
 export default function Studio() {
   const [img, setImg] = useState<string>("");
@@ -21,9 +37,13 @@ export default function Studio() {
   const [translated, setTranslated] = useState<TransItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [from, setFrom] = useState<"ja" | "en">("ja");
-  const [useDirectIA, setUseDirectIA] = useState(false);
 
-  const hasTranslation = translated.some((t) => t.text);
+  // progreso
+  const [progress, setProgress] = useState<number>(0);
+  const [phase, setPhase] = useState<Phase>("idle");
+
+  // ✅ ahora mostramos la lista apenas haya elementos (aunque estén vacíos)
+  const hasTranslation = translated.length > 0;
 
   const onDrop = useCallback(async (files: File[]) => {
     const f = files?.[0];
@@ -53,82 +73,27 @@ export default function Studio() {
         return;
       }
       setLoading(true);
+      setPhase("validating");
+      setProgress(5);
 
-      // 1) Construir mosaico (y opcionalmente crops para IA directa)
-      const {
-        b64: sheetB64,
-        cells,
-        crops,
-      } = await buildRoiMosaicOneColumn(img, rois, imgSize.w, STAGE_W, {
-        cellW: 600,
-        padding: 18,
-        returnCrops: useDirectIA, // ← si activaste IA directa, también devolvé crops
-        cropMaxW: 768, // controla tamaño/costo de la IA
-        cropFormat: "image/jpeg",
-        cropJpegQuality: 0.85,
-      });
-
-      // === PIPELINE: IA DIRECTA POR ROIs (experimental) ===
-      if (useDirectIA) {
-        const requestId = crypto.randomUUID();
-        const roiCount = crops?.length ?? 0;
-        if (roiCount === 0) {
-          toast.error("No se pudieron generar recortes para IA directa");
-          return;
+      // 1) Mosaico (solo OCR→texto)
+      setPhase("mosaic");
+      setProgress(20);
+      const { b64: sheetB64, cells } = await buildRoiMosaicOneColumn(
+        img,
+        rois,
+        imgSize.w,
+        STAGE_W,
+        {
+          cellW: 600,
+          padding: 18,
+          returnCrops: false,
         }
-        const sourceLang = from === "en" ? "en" : "ja";
-        const targetLang = "es";
-
-        const trRes = await fetch("/api/translate-direct", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            meta: {
-              requestId,
-              source_lang: sourceLang,
-              target_lang: targetLang,
-              roi_count: roiCount,
-              image_w: imgSize.w,
-              image_h: imgSize.h,
-            },
-            from,
-            crops, // [{id, b64}]
-          }),
-        });
-
-        if (trRes.status === 401) {
-          toast.error("Sesión expirada. Entrá de nuevo.");
-          return;
-        }
-        if (trRes.status === 429) {
-          toast.error("Demasiadas solicitudes. Probá en un minuto.");
-          return;
-        }
-        const tr = await trRes.json();
-        if (tr.error) {
-          toast.error(tr.error);
-          return;
-        }
-
-        // Ordenar por id de ROI para que coincida con la UI
-        const out: TransItem[] = rois
-          .map((r) => {
-            const hit = tr.items?.find(
-              (x: TransItem) => String(x.id) === String(r.id)
-            );
-            return { id: r.id, text: postGlossaryEs(hit?.text || "") };
-          })
-          .sort((a, b) => a.id - b.id);
-
-        setTranslated(out);
-        toast.success("¡Listo (IA directa)!");
-        window.dispatchEvent(new Event("credits:updated"));
-        return;
-      }
-
-      // === PIPELINE CLÁSICO: OCR → IA TEXTO ===
+      );
 
       // 2) OCR del mosaico
+      setPhase("ocr");
+      setProgress(40);
       const ocrRes = await fetch("/api/ocr", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -137,29 +102,27 @@ export default function Studio() {
 
       if (ocrRes.status === 422) {
         const payload = await ocrRes.json();
-        toast.error(
-          payload?.error || "No se detectó texto. No se descontaron créditos."
-        );
-        return;
-      }
-      
-      if (ocrRes.status === 401) {
-        toast.error("Sesión expirada. Entrá de nuevo.");
-        return;
-      }
-      if (ocrRes.status === 429) {
-        toast.error("Demasiadas solicitudes. Probá en un minuto.");
-        return;
+        toast.error(payload?.error || "No se detectó texto. No se descontaron créditos.");
+        // Aun así, seguimos para poder mostrar ROIs vacíos
+      } else {
+        if (ocrRes.status === 401) {
+          toast.error("Sesión expirada. Entrá de nuevo.");
+          return;
+        }
+        if (ocrRes.status === 429) {
+          toast.error("Demasiadas solicitudes. Probá en un minuto.");
+          return;
+        }
       }
 
-      const ocr = await ocrRes.json();
-      if (ocr.error) throw new Error(ocr.error);
+      const ocr = await ocrRes.json().catch(() => ({ words: [] as any[] }));
+      const words: { text: string; box: { x: number; y: number }[] }[] = ocr?.words || [];
 
-      const words: { text: string; box: { x: number; y: number }[] }[] =
-        ocr.words || [];
+      // 3) Agrupar palabras por celda
+      setPhase("grouping");
+      setProgress(55);
       const cellText: Record<number, string[]> = {};
       cells.forEach((c) => (cellText[c.id] = []));
-
       for (const w of words) {
         const c = centroid(w.box);
         const cell = cells.find(
@@ -171,24 +134,33 @@ export default function Studio() {
         );
         if (cell) cellText[cell.id].push(w.text);
       }
-      const itemsSrc = cells
-        .map((c) => ({
-          id: c.id,
-          text: normalizeJa((cellText[c.id] || []).join("")),
-        }))
-        .filter((i) => i.text.length);
 
-      if (!itemsSrc.length)
-        throw new Error("No se reconoció texto en los globos.");
+      // ✅ itemsAll (todos los ROIs seleccionados), aunque estén vacíos
+      const itemsAll = cells.map((c) => ({
+        id: c.id,
+        text: normalizeJa((cellText[c.id] || []).join("")),
+      }));
 
-      // 3) Meta para backend (créditos)
+      // Para la API, solo mandamos los que tienen texto
+      const itemsSrc = itemsAll.filter((i) => i.text.length > 0);
+
+      // 4) Si no hubo NINGÚN texto, mostramos igual la lista vacía, sin llamar a la API
+      if (itemsSrc.length === 0) {
+        setTranslated(itemsAll.map(({ id }) => ({ id, text: "" })));
+        setProgress(100);
+        toast.error("No se reconoció texto en los globos seleccionados.");
+        return;
+      }
+
+      // 5) Traducción
+      setPhase("translate");
+      setProgress(75);
       const requestId = crypto.randomUUID();
-      const roiCount = itemsSrc.length;
+      const roiCount = itemsSrc.length; // 👈 sin cambios en facturación
       const charCount = itemsSrc.reduce((acc, it) => acc + it.text.length, 0);
       const sourceLang = from === "en" ? "en" : "ja";
       const targetLang = "es";
 
-      // 4) Traducción + gasto (endpoint transaccional)
       const trRes = await fetch(`/api/translate-and-spend`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -197,13 +169,13 @@ export default function Studio() {
             requestId,
             source_lang: sourceLang,
             target_lang: targetLang,
-            roi_count: roiCount,
+            roi_count: roiCount, // 👈 seguimos enviando sólo los con texto
             char_count: charCount,
             image_w: imgSize.w,
             image_h: imgSize.h,
           },
           from,
-          items: itemsSrc, // [{id, text}]
+          items: itemsSrc, // 👈 sólo con texto
         }),
       });
 
@@ -215,19 +187,26 @@ export default function Studio() {
         toast.error("Demasiadas solicitudes. Probá en un minuto.");
         return;
       }
+
       const tr = await trRes.json();
       if (tr.error) throw new Error(tr.error);
 
-      const out: TransItem[] = itemsSrc
-        .map((it) => {
-          const hit = tr.items?.find(
-            (x: TransItem) => String(x.id) === String(it.id)
-          );
-          return { id: it.id, text: postGlossaryEs(hit?.text || "") };
-        })
+      // 6) Render de resultados — ✅ mapeamos TODOS los ROIs,
+      //    si uno no se mandó (sin texto), queda como "" y mostramos "(sin texto)"
+      setPhase("render");
+      setProgress(90);
+      const outMap = new Map<string, string>(
+        (tr.items || []).map((x: TransItem) => [String(x.id), x.text || ""])
+      );
+      const out: TransItem[] = itemsAll
+        .map((it) => ({
+          id: it.id,
+          text: postGlossaryEs(outMap.get(String(it.id)) || ""), // puede quedar vacío
+        }))
         .sort((a, b) => a.id - b.id);
 
       setTranslated(out);
+      setProgress(100);
       toast.success("¡Listo!");
       window.dispatchEvent(new Event("credits:updated"));
     } catch (e: unknown) {
@@ -235,11 +214,18 @@ export default function Studio() {
       toast.error(msg);
     } finally {
       setLoading(false);
+      setTimeout(() => {
+        setPhase("idle");
+        setProgress(0);
+      }, 600);
     }
   }
 
   const joined = useMemo(
-    () => translated.map((t) => `#${t.id} ${t.text}`).join("\n"),
+    () =>
+      translated
+        .map((t) => `#${t.id} ${t.text || "(sin texto)"}`)
+        .join("\n"),
     [translated]
   );
 
@@ -271,8 +257,7 @@ export default function Studio() {
           <>
             <div className="flex justify-between items-center mb-2 text-xs text-neutral-400">
               <span>
-                Dimensiones originales: {imgSize?.w} × {imgSize?.h}px —
-                Seleccioná los globos en orden.
+                Dimensiones originales: {imgSize?.w} × {imgSize?.h}px — Seleccioná los globos en orden.
               </span>
               <button
                 onClick={() => {
@@ -306,39 +291,13 @@ export default function Studio() {
               value={from}
               onChange={(e) => setFrom(e.target.value as any)}
               className="border rounded px-2 py-1 text-sm bg-neutral-900 border-neutral-800"
+              disabled={loading}
             >
               <option value="ja">Japonés → Español</option>
               <option value="en">Inglés → Español</option>
             </select>
-
-            {/* Switch con tooltip bonito */}
-            <div className="relative group flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={useDirectIA}
-                onChange={(e) => setUseDirectIA(e.target.checked)}
-                className="cursor-pointer"
-                id="directIA"
-              />
-              <label
-                htmlFor="directIA"
-                className="text-sm select-none cursor-pointer"
-              >
-                IA directa (sin OCR)
-              </label>
-              <div className="absolute bottom-full mb-2 hidden w-64 rounded-lg bg-neutral-900 text-white text-xs p-3 shadow-lg group-hover:block transition-opacity duration-200">
-                <p className="font-semibold text-amber-400 mb-1">
-                  ⚠️ Experimental
-                </p>
-                <p>
-                  Este modo saltea el OCR: recorta cada globo y lo envía directo
-                  a la IA. Puede mejorar calidad en algunos casos, pero su costo
-                  es <span className="text-red-400 font-semibold">MUCHO</span>{" "}
-                  mayor por globo (10 creditos).
-                </p>
-              </div>
-            </div>
           </div>
+
           <button
             onClick={run}
             disabled={!img || !rois.length || loading}
@@ -346,6 +305,22 @@ export default function Studio() {
           >
             {loading ? "Procesando..." : "Traducir seleccionados"}
           </button>
+
+          {/* Barra de progreso */}
+          {loading && (
+            <div className="w-full mt-3">
+              <div className="flex items-center justify-between text-xs text-neutral-400 mb-1">
+                <span>{phaseLabel[phase] || "Procesando…"}</span>
+                <span>{progress}%</span>
+              </div>
+              <div className="h-2 w-full rounded bg-neutral-800 overflow-hidden">
+                <div
+                  className="h-full bg-emerald-600 transition-[width] duration-300"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -377,9 +352,11 @@ export default function Studio() {
                 {translated.map((t) => (
                   <li
                     key={t.id}
-                    className="p-2 bg-neutral-900 text-white border border-neutral-700 rounded"
+                    className={`p-2 border rounded ${
+                      t.text ? "bg-neutral-900 text-white border-neutral-700" : "bg-neutral-900/40 text-neutral-400 border-neutral-800"
+                    }`}
                   >
-                    {t.text || "(vacío)"}
+                    {t.text || "(sin texto)"}
                   </li>
                 ))}
               </ol>
@@ -391,9 +368,7 @@ export default function Studio() {
                   Copiar todo
                 </button>
                 <a
-                  href={`data:text/plain;charset=utf-8,${encodeURIComponent(
-                    joined
-                  )}`}
+                  href={`data:text/plain;charset=utf-8,${encodeURIComponent(joined)}`}
                   download="traduccion.txt"
                   className="text-sm px-3 py-1.5 rounded border border-neutral-800"
                 >
